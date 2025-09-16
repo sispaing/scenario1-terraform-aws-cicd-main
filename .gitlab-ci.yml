@@ -1,0 +1,116 @@
+# .gitlab-ci.yml - SRE Best Practice for Monorepo Terraform
+
+stages:
+  - validate
+  - plan
+  - apply
+  - destroy
+
+# This template defines the common setup for all Terraform jobs
+.terraform-template:
+  image:
+    name: hashicorp/terraform:latest
+    entrypoint: [""]
+  before_script:
+    # CRITICAL: All commands are executed from within the 'infra' directory
+    - cd infra
+    # Initialize the S3 backend using variables from GitLab's CI/CD settings
+    - |
+      terraform init -reconfigure \
+        -backend-config="bucket=$TF_STATE_BUCKET" \
+        -backend-config="key=$TF_STATE_KEY" \
+        -backend-config="region=$AWS_DEFAULT_REGION"
+
+# Stage 1: Validate the code for syntax correctness
+validate:
+  stage: validate
+  extends: .terraform-template
+  script:
+    - terraform validate
+
+# Stage 2: Create an execution plan to see what will change
+plan:
+  stage: plan
+  extends: .terraform-template
+  script:
+    # Pass the GitLab variable to the Terraform variable
+    - terraform plan -var="public_key_content=$SSH_PUBLIC_KEY" -out=plan.tfplan 
+  artifacts:
+    # Save the plan file to be used by the apply job
+    paths:
+      - infra/plan.tfplan
+  rules:
+    # BEST PRACTICE: Only run this job if files in 'infra/' or 'web-content/' change.
+    # This prevents running pipelines for irrelevant changes (e.g., updating a README).
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - infra/**/*
+        - web-content/**/*
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes:
+        - infra/**/*
+        - web-content/**/*
+
+# Stage 3: Manually approve and apply the changes
+apply:
+  stage: apply
+  extends: .terraform-template
+  script:
+    # Apply the exact plan that was created and approved
+    - terraform apply -auto-approve "plan.tfplan"
+  dependencies:
+    - plan
+  rules:
+    # This job only appears for the main branch and must be triggered manually
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+      # Also check for changes to ensure we don't show a manual 'apply' for no reason
+      changes:
+        - infra/**/*
+        - web-content/**/*
+
+# -----------------------------------------------------------------------------
+# DESTRUCTION WORKFLOW
+# -----------------------------------------------------------------------------
+
+# Stage 4, Job 1: Create a destruction plan
+# This job is manual so it doesn't run unless you explicitly want to.
+plan_destroy:
+  stage: destroy
+  extends: .terraform-template
+  script:
+    # The -destroy flag creates a plan to destroy all remote objects
+    - terraform plan -destroy -var="public_key_content=$SSH_PUBLIC_KEY" -out=plan.destroy.tfplan
+  artifacts:
+    # Save the destruction plan file to be used by the destroy job
+    paths:
+      - infra/plan.destroy.tfplan
+  rules:
+    # Show this job for the main branch, but require manual trigger
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+
+# Stage 4, Job 2: Execute the destruction plan
+# This job is also manual and adds a second layer of protection by requiring a variable.
+destroy:
+  stage: destroy
+  extends: .terraform-template
+  script:
+    # SAFETY CHECK: This command will fail if the variable is not set to "true"
+    - |
+      if [ "$CONFIRM_DESTROY" != "true" ]; then
+        echo "ERROR: To prevent accidental destruction, you must run this job"
+        echo "with the CI/CD variable CONFIRM_DESTROY set to 'true'."
+        exit 1
+      fi
+    # Apply the exact destruction plan
+    - terraform apply -auto-approve "plan.destroy.tfplan"
+  needs:
+    - job: plan_destroy
+      artifacts: true
+  rules:
+    # Show this job for the main branch, require manual trigger, and only after plan_destroy runs
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+
+
